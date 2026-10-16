@@ -24,14 +24,21 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/sandbox"
+	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
+	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
+	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
+	ostesting "github.com/containerd/containerd/v2/pkg/os/testing"
 	"github.com/containerd/log"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 type testLogHook struct {
@@ -234,4 +241,108 @@ func TestCheckpointArchiveEntryAllowed(t *testing.T) {
 			assert.Equal(t, tc.allowed, got)
 		})
 	}
+}
+
+func TestCRImportCheckpointRestoreViaCreateDisabled(t *testing.T) {
+	c := newTestCRIService()
+	c.config.EnableExperimentalRestoreViaCreate = false
+	_, err := c.CRImportCheckpoint(context.Background(), nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "checkpoint restore via CreateContainer is disabled by configuration") {
+		t.Errorf("expected error containing 'checkpoint restore via CreateContainer is disabled by configuration', got: %v", err)
+	}
+}
+
+func TestCRImportCheckpointRestoreViaCreateEnabled(t *testing.T) {
+	c := newTestCRIService()
+	c.config.EnableExperimentalRestoreViaCreate = true
+	// With the option enabled the restore path is entered and the regular
+	// input validation applies.
+	_, err := c.CRImportCheckpoint(context.Background(), &containerstore.Metadata{
+		Config: &runtime.ContainerConfig{},
+	}, nil, nil)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "disabled by configuration")
+	assert.Contains(t, err.Error(), `attribute "image" missing from container definition`)
+}
+
+// readySandboxService reports every sandbox as ready so that CreateContainer
+// gets past the sandbox status lookup.
+type readySandboxService struct {
+	fakeSandboxService
+}
+
+func (f *readySandboxService) SandboxStatus(ctx context.Context, sandboxer string, sandboxID string, verbose bool) (sandbox.ControllerStatus, error) {
+	return sandbox.ControllerStatus{SandboxID: sandboxID, State: "SANDBOX_READY"}, nil
+}
+
+// createContainerFromCheckpointArchive issues a CRI CreateContainer request
+// whose image is a checkpoint archive file on the host, which CreateContainer
+// hands to the checkpoint restore code.
+func createContainerFromCheckpointArchive(t *testing.T, c *criService) (*runtime.ContainerMetadata, *runtime.PodSandboxMetadata, error) {
+	t.Helper()
+
+	const (
+		sandboxID   = "restore-sandbox-id"
+		sandboxName = "restore-sandbox-name"
+	)
+
+	c.sandboxService = &readySandboxService{}
+	c.os.(*ostesting.FakeOS).StatFn = os.Stat
+	require.NoError(t, c.sandboxStore.Add(sandboxstore.NewSandbox(
+		sandboxstore.Metadata{ID: sandboxID, Name: sandboxName},
+		sandboxstore.Status{State: sandboxstore.StateReady},
+	)))
+
+	// Attacker supplied checkpoint archive on the host.
+	archivePath := filepath.Join(t.TempDir(), "checkpoint.tar")
+	require.NoError(t, os.WriteFile(archivePath, []byte("not a checkpoint archive"), 0o600))
+
+	containerMetadata := &runtime.ContainerMetadata{Name: "restored"}
+	sandboxMetadata := &runtime.PodSandboxMetadata{Name: "pod", Uid: "uid", Namespace: "ns"}
+	_, err := c.CreateContainer(context.Background(), &runtime.CreateContainerRequest{
+		PodSandboxId: sandboxID,
+		Config: &runtime.ContainerConfig{
+			Metadata: containerMetadata,
+			Image:    &runtime.ImageSpec{Image: archivePath},
+		},
+		SandboxConfig: &runtime.PodSandboxConfig{Metadata: sandboxMetadata},
+	})
+	return containerMetadata, sandboxMetadata, err
+}
+
+// TestCreateContainerRestoreViaCreateDisabledByDefault drives the CRI
+// CreateContainer entry point with a checkpoint archive as the container image.
+// With the default configuration the request must be rejected before the
+// archive is opened or unpacked.
+func TestCreateContainerRestoreViaCreateDisabledByDefault(t *testing.T) {
+	c := newTestCRIService()
+	c.config.EnableExperimentalRestoreViaCreate = criconfig.DefaultRuntimeConfig().EnableExperimentalRestoreViaCreate
+	require.False(t, c.config.EnableExperimentalRestoreViaCreate)
+
+	containerMetadata, sandboxMetadata, err := createContainerFromCheckpointArchive(t, c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checkpoint restore via CreateContainer is disabled by configuration")
+	assert.NotContains(t, err.Error(), "unpacking of checkpoint archive")
+
+	// The rejected request must not leave a container behind and must release
+	// the reserved container name.
+	assert.Empty(t, c.containerStore.List())
+	assert.NoError(t, c.containerNameIndex.Reserve(makeContainerName(containerMetadata, sandboxMetadata), "other-id"))
+}
+
+// TestCreateContainerRestoreViaCreateEnabledOpensArchive is the control for the
+// test above: only when restore via CreateContainer is explicitly enabled does
+// the same request reach the restore code, which opens and unpacks the archive.
+func TestCreateContainerRestoreViaCreateEnabledOpensArchive(t *testing.T) {
+	c := newTestCRIService()
+	c.config.EnableExperimentalRestoreViaCreate = true
+
+	_, _, err := createContainerFromCheckpointArchive(t, c)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "disabled by configuration")
+	assert.Contains(t, err.Error(), "unpacking of checkpoint archive")
+	assert.Empty(t, c.containerStore.List())
 }

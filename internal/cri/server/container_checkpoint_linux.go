@@ -189,6 +189,9 @@ func (c *criService) CRImportCheckpoint(
 	sandbox *sandbox.Sandbox,
 	sandboxConfig *runtime.PodSandboxConfig,
 ) (ctrID string, retErr error) {
+	if !c.config.EnableExperimentalRestoreViaCreate {
+		return "", errors.New("checkpoint restore via CreateContainer is disabled by configuration")
+	}
 	var mountPoint string
 	start := time.Now()
 	// Ensure that the image to restore the checkpoint from has been provided.

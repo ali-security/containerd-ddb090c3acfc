@@ -18,9 +18,11 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"runtime"
 	"testing"
 
+	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/assert"
 	criruntime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
@@ -507,4 +509,60 @@ func TestCheckLocalImagePullConfigs(t *testing.T) {
 			assert.Equal(t, tc.expectLocalPull, imageConfig.UseLocalImagePull)
 		})
 	}
+}
+
+func TestDefaultConfigEnableExperimentalRestoreViaCreate(t *testing.T) {
+	cfg := DefaultRuntimeConfig()
+	assert.False(t, cfg.EnableExperimentalRestoreViaCreate)
+}
+
+func TestParseEnableExperimentalRestoreViaCreate(t *testing.T) {
+	testCases := []struct {
+		name            string
+		tomlStr         string
+		expectedRestore bool
+	}{
+		{
+			name: "enable_experimental_restore_via_create set to true",
+			tomlStr: `
+enable_experimental_restore_via_create = true
+`,
+			expectedRestore: true,
+		},
+		{
+			name: "enable_experimental_restore_via_create set to false",
+			tomlStr: `
+enable_experimental_restore_via_create = false
+`,
+			expectedRestore: false,
+		},
+		{
+			name: "enable_experimental_restore_via_create absent",
+			tomlStr: `
+# empty or other fields
+`,
+			expectedRestore: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultRuntimeConfig()
+			err := toml.Unmarshal([]byte(tc.tomlStr), &cfg)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectedRestore, cfg.EnableExperimentalRestoreViaCreate)
+		})
+	}
+}
+
+func TestJSONEnableExperimentalRestoreViaCreate(t *testing.T) {
+	jsonStr := `{"enableExperimentalRestoreViaCreate": true}`
+	cfg := DefaultRuntimeConfig()
+	err := json.Unmarshal([]byte(jsonStr), &cfg)
+	assert.NoError(t, err)
+	assert.True(t, cfg.EnableExperimentalRestoreViaCreate)
+
+	b, err := json.Marshal(cfg)
+	assert.NoError(t, err)
+	assert.Contains(t, string(b), `"enableExperimentalRestoreViaCreate":true`)
 }

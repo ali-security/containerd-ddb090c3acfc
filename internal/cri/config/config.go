@@ -427,6 +427,11 @@ type RuntimeConfig struct {
 	// IgnoreDeprecationWarnings is the list of the deprecation IDs (such as "io.containerd.deprecation/pull-schema-1-image")
 	// that should be ignored for checking "ContainerdHasNoDeprecationWarnings" condition.
 	IgnoreDeprecationWarnings []string `toml:"ignore_deprecation_warnings" json:"ignoreDeprecationWarnings"`
+
+	// EnableExperimentalRestoreViaCreate enables experimental restore of container checkpoints via CreateContainer.
+	// When set to false, checkpoint restore via CreateContainer will be disabled.
+	// Default: false
+	EnableExperimentalRestoreViaCreate bool `toml:"enable_experimental_restore_via_create" json:"enableExperimentalRestoreViaCreate"`
 }
 
 // X509KeyPairStreaming contains the x509 configuration for streaming
