@@ -716,6 +716,38 @@ func TestBreakouts(t *testing.T) {
 			validator: fileNotExists("etc/passwd"),
 		},
 		{
+			name: "WhiteoutOpaque",
+			apply: fstest.Apply(
+				fstest.CreateDir("/etc/", 0755),
+				fstest.CreateFile("/etc/passwd", []byte("all users"), 0644),
+				fstest.CreateFile("/etc/shadow", []byte("root:secret"), 0600),
+			),
+			w: tartest.TarAll(
+				tc.File("etc/.wh..wh..opq", []byte{}, 0600),
+				tc.File("etc/group", []byte("all groups"), 0644),
+			),
+			validator: all(
+				fileNotExists("etc/passwd"),
+				fileNotExists("etc/shadow"),
+				fileValue("etc/group", []byte("all groups")),
+			),
+		},
+		{
+			name: "WhiteoutOpaqueOutOfOrder",
+			apply: fstest.Apply(
+				fstest.CreateDir("/etc/", 0755),
+				fstest.CreateFile("/etc/passwd", []byte("all users"), 0644),
+			),
+			w: tartest.TarAll(
+				tc.File("etc/group", []byte("all groups"), 0644),
+				tc.File("etc/.wh..wh..opq", []byte{}, 0600),
+			),
+			validator: all(
+				fileNotExists("etc/passwd"),
+				fileValue("etc/group", []byte("all groups")),
+			),
+		},
+		{
 			name: "SymlinkOverridePath",
 			w: tartest.TarAll(
 				tc.Dir("foo", 0755),
@@ -1462,5 +1494,205 @@ func readDirNames(p string) ([]string, error) {
 func requireTar(t *testing.T) {
 	if _, err := exec.LookPath(tarCmd); err != nil {
 		t.Skipf("%s not found, skipping", tarCmd)
+	}
+}
+
+func TestRepeatedOpaqueWhiteout(t *testing.T) {
+	ctx := t.Context()
+	td := t.TempDir()
+
+	// Create base directory with lower-layer file
+	if err := os.WriteFile(filepath.Join(td, "oldfile"), []byte("lower"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a tar with interleaved files and opaque whiteouts
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	const n = 500
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("f%04d", i)
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Mode:     0644,
+			Size:     1,
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     whiteoutOpaqueDir,
+			Mode:     0600,
+			Size:     0,
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Apply(ctx, td, &buf, WithNoSameOwner()); err != nil {
+		t.Fatalf("failed to apply tar: %v", err)
+	}
+
+	// Verify oldfile was removed by opaque whiteout
+	if _, err := os.Lstat(filepath.Join(td, "oldfile")); !os.IsNotExist(err) {
+		t.Errorf("expected oldfile to be removed, err: %v", err)
+	}
+
+	// Verify all unpacked files exist
+	for i := 0; i < n; i++ {
+		p := filepath.Join(td, fmt.Sprintf("f%04d", i))
+		if _, err := os.Lstat(p); err != nil {
+			t.Errorf("expected %s to exist, err: %v", p, err)
+		}
+	}
+}
+
+// sentinelReader serves data and calls plant once, right before the first
+// read at or beyond offset at. Reads never cross that offset, so plant only
+// runs after every entry before it has been consumed and applied.
+type sentinelReader struct {
+	data    []byte
+	off     int
+	at      int
+	plant   func() error
+	planted bool
+}
+
+func (r *sentinelReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	if r.off >= r.at && !r.planted {
+		r.planted = true
+		if err := r.plant(); err != nil {
+			return 0, err
+		}
+	}
+	end := len(r.data)
+	if r.off < r.at {
+		end = r.at
+	}
+	n := copy(p, r.data[r.off:end])
+	r.off += n
+	return n, nil
+}
+
+// TestRepeatedOpaqueWhiteoutWalksOnce verifies that an opaque whiteout marker
+// repeated for the same directory does not walk that directory again. A
+// sentinel file is created once the first marker has been applied; a
+// redundant walk for the repeated marker would remove it.
+func TestRepeatedOpaqueWhiteoutWalksOnce(t *testing.T) {
+	ctx := t.Context()
+	td := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(td, "oldfile"), []byte("lower"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	writeEntry := func(name string, content []byte, mode int64) {
+		t.Helper()
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Mode:     mode,
+			Size:     int64(len(content)),
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeEntry(whiteoutOpaqueDir, nil, 0600)
+	if err := tw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	plantAt := buf.Len()
+	writeEntry("f0000", []byte("x"), 0644)
+	writeEntry(whiteoutOpaqueDir, nil, 0600)
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sentinel := filepath.Join(td, "sentinel")
+	r := &sentinelReader{
+		data: buf.Bytes(),
+		at:   plantAt,
+		plant: func() error {
+			return os.WriteFile(sentinel, []byte("sentinel"), 0644)
+		},
+	}
+	if _, err := Apply(ctx, td, r, WithNoSameOwner()); err != nil {
+		t.Fatalf("failed to apply tar: %v", err)
+	}
+	if !r.planted {
+		t.Fatal("sentinel was never planted")
+	}
+
+	if _, err := os.Lstat(filepath.Join(td, "oldfile")); !os.IsNotExist(err) {
+		t.Errorf("expected oldfile to be removed by the first opaque whiteout, err: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(td, "f0000")); err != nil {
+		t.Errorf("expected f0000 to exist, err: %v", err)
+	}
+	if _, err := os.Lstat(sentinel); err != nil {
+		t.Errorf("repeated opaque whiteout walked %s again: %v", td, err)
+	}
+}
+
+func BenchmarkRepeatedOpaqueWhiteout(b *testing.B) {
+	ctx := b.Context()
+
+	// Build tar payload with interleaved files and opaque whiteouts
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	const n = 1000
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("f%04d", i)
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Mode:     0644,
+			Size:     1,
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := tw.Write([]byte("x")); err != nil {
+			b.Fatal(err)
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     whiteoutOpaqueDir,
+			Mode:     0600,
+			Size:     0,
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	payload := buf.Bytes()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		td := b.TempDir()
+		if _, err := Apply(ctx, td, bytes.NewReader(payload), WithNoSameOwner()); err != nil {
+			b.Fatalf("failed to apply tar: %v", err)
+		}
 	}
 }
