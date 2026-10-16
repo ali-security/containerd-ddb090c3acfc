@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math"
 	"os"
@@ -984,7 +985,7 @@ func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 			defer ensureAdditionalGids(s)
 
 			var ugroups []user.Group
-			f, groupErr := root.Open("etc/group")
+			f, groupErr := openBoundedUserFile(root, "etc/group")
 			if groupErr == nil {
 				defer f.Close()
 				ugroups, groupErr = user.ParseGroup(f)
@@ -1163,7 +1164,7 @@ func UserFromPath(root string, filter func(user.User) bool) (user.User, error) {
 // UserFromFS inspects the user object using /etc/passwd in the specified fs.FS.
 // filter can be nil.
 func UserFromFS(root fs.FS, filter func(user.User) bool) (user.User, error) {
-	f, err := root.Open("etc/passwd")
+	f, err := openBoundedUserFile(root, "etc/passwd")
 	if err != nil {
 		return user.User{}, err
 	}
@@ -1195,7 +1196,7 @@ func GIDFromPath(root string, filter func(user.Group) bool) (gid uint32, err err
 // GIDFromFS inspects the GID using /etc/group in the specified fs.FS.
 // filter can be nil.
 func GIDFromFS(root fs.FS, filter func(user.Group) bool) (gid uint32, err error) {
-	f, err := root.Open("etc/group")
+	f, err := openBoundedUserFile(root, "etc/group")
 	if err != nil {
 		return 0, err
 	}
@@ -1212,7 +1213,7 @@ func GIDFromFS(root fs.FS, filter func(user.Group) bool) (gid uint32, err error)
 }
 
 func getSupplementalGroupsFromFS(root fs.FS, filter func(user.Group) bool) ([]uint32, error) {
-	f, err := root.Open("etc/group")
+	f, err := openBoundedUserFile(root, "etc/group")
 	if err != nil {
 		return []uint32{}, err
 	}
@@ -1809,4 +1810,59 @@ func WithWindowsNetworkNamespace(ns string) SpecOpts {
 		s.Windows.Network.NetworkNamespace = ns
 		return nil
 	}
+}
+
+// maxUserFileBytes caps how much data is read from any user-database file
+// opened via openBoundedUserFile. Real systems keep these files well under
+// 1 MiB; 10 MiB is generous headroom while keeping peak memory during
+// user.ParsePasswd/ParseGroup bounded to single-digit MiB.
+const maxUserFileBytes = 10 << 20
+
+// openBoundedUserFile opens name within root and returns an io.ReadCloser
+// that errors out if more than maxUserFileBytes are read from it. Non-regular
+// sources are rejected before opening, so callers never block on FIFOs or
+// device files and parsers never consume bytes from them.
+//
+// openBoundedUserFile does NOT perform any path validation of its own. It
+// follows symlinks both when stat-ing and when opening, and relies on root
+// to confine name to the intended tree (e.g. an fs.FS obtained from
+// os.Root.FS, which refuses to resolve paths or symlinks that escape the
+// container rootfs). Callers must not pass an unconfined fs.FS together with
+// attacker-controlled names.
+func openBoundedUserFile(root fs.FS, name string) (io.ReadCloser, error) {
+	info, err := fs.Stat(root, name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &limitedFile{
+		Closer: f,
+		// Allow one byte past the cap so an overflow surfaces as an
+		// error rather than a silent EOF that the parser would treat as
+		// a clean end-of-file (and miss any entries past the cap).
+		r:    &io.LimitedReader{R: f, N: maxUserFileBytes + 1},
+		name: name,
+	}, nil
+}
+
+// limitedFile is an io.ReadCloser whose Read returns an error once more than
+// maxUserFileBytes have been read.
+type limitedFile struct {
+	io.Closer
+	r    *io.LimitedReader
+	name string
+}
+
+func (l *limitedFile) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.r.N == 0 {
+		return n, fmt.Errorf("%q exceeds %d bytes", l.name, maxUserFileBytes)
+	}
+	return n, err
 }
